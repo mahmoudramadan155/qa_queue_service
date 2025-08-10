@@ -1,0 +1,387 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    container_name: postgres_db
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=qa_db
+      - POSTGRES_USER=qa_user
+      - POSTGRES_PASSWORD=qa_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qa_user -d qa_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Message Broker and Cache
+  redis:
+    container_name: redis_server
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # RabbitMQ - Alternative Message Broker
+  rabbitmq:
+    container_name: rabbitmq_server
+    image: rabbitmq:3-management-alpine
+    environment:
+      - RABBITMQ_DEFAULT_USER=qa_user
+      - RABBITMQ_DEFAULT_PASS=qa_password
+      - RABBITMQ_DEFAULT_VHOST=qa_vhost
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      # - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # profiles:
+    #   - rabbitmq
+
+  # Qdrant Vector Database
+  qdrant:
+    container_name: qdrant_db
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+      # - ./ssl/qdrant.crt:/qdrant/tls/cert.pem
+      # - ./ssl/qdrant.key:/qdrant/tls/key.pem
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__LOG_LEVEL=INFO
+      # - QDRANT__SERVICE__TLS__ENABLED=true
+      # - QDRANT__SERVICE__TLS__CERT=/qdrant/tls/cert.pem
+      # - QDRANT__SERVICE__TLS__KEY=/qdrant/tls/key.pem
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  # Main FastAPI Application
+  web:
+    build: .
+    container_name: qa_web_app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8009
+    ports:
+      - "8009:8009"
+    environment:
+      - DATABASE_URL=postgresql://qa_user:qa_password@postgres:5432/qa_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - REDIS_URL=redis://redis:6379/1
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3:1.7b
+    volumes:
+      - ./app:/app/app
+      - ./static:/app/static
+      - app_logs:/app/logs
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+      - ollama
+      # postgres:
+      #   condition: service_healthy
+      # redis:
+      #   condition: service_healthy
+      # qdrant:
+      #   condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker - Document Processing
+  celery-worker-documents:
+    build: .
+    container_name: celery_worker_documents
+    user: celeryuser
+    command: celery -A app.celery_app:celery_app worker --loglevel=info --queues=document_processing --concurrency=2 --hostname=worker-docs@%h
+    environment:
+      - DATABASE_URL=postgresql://qa_user:qa_password@postgres:5432/qa_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - REDIS_URL=redis://redis:6379/1
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://ollama:11434
+      #- CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
+    volumes:
+      - ./app:/app/app
+      - worker_temp:/tmp
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    networks:
+      - qa-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Celery Worker - Question Answering
+  celery-worker-qa:
+    build: .
+    container_name: celery_worker_qa
+    user: celeryuser
+    command: celery -A app.celery_app:celery_app worker --loglevel=info --queues=question_answering,high_priority --concurrency=4 --hostname=worker-qa@%h
+    environment:
+      - DATABASE_URL=postgresql://qa_user:qa_password@postgres:5432/qa_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - REDIS_URL=redis://redis:6379/1
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://ollama:11434
+      #- CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
+    volumes:
+      - ./app:/app/app
+      - worker_temp:/tmp
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    networks:
+      - qa-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  # Celery Worker - User Management
+  celery-worker-users:
+    build: .
+    container_name: celery_worker_users
+    user: celeryuser
+    command: celery -A app.celery_app:celery_app worker --loglevel=info --queues=user_management --concurrency=2 --hostname=worker-users@%h
+    environment:
+      - DATABASE_URL=postgresql://qa_user:qa_password@postgres:5432/qa_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - REDIS_URL=redis://redis:6379/1
+      - QDRANT_URL=http://qdrant:6333
+      #- CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - qa-network
+    restart: unless-stopped
+
+  # Celery Beat - Scheduler
+  celery-beat:
+    build: .
+    container_name: celery_beat
+    command: celery -A app.celery_app:celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule --pidfile=/tmp/celerybeat.pid
+    environment:
+      - DATABASE_URL=postgresql://qa_user:qa_password@postgres:5432/qa_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - REDIS_URL=redis://redis:6379/1
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3:1.7b
+      #- CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
+    volumes:
+      - ./app:/app/app
+      - celery_beat_data:/tmp
+    depends_on:
+      - postgres
+      - redis
+      - ollama
+      # postgres:
+      #   condition: service_healthy
+      # redis:
+      #   condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
+    networks:
+      - qa-network
+    restart: unless-stopped
+
+  # Flower - Celery Monitoring
+  flower:
+    build: .
+    container_name: celery_flower
+    command: celery -A app.celery_app:celery_app --broker=redis://redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    networks:
+      - qa-network
+    restart: unless-stopped
+
+  # Ollama - Local LLM (Optional)
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    container_name: ollama_server
+    # image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./ollama_start.sh:/ollama_start.sh
+    environment:
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_MODEL=qwen3:1.7b
+    entrypoint: ["/bin/bash", "/ollama_start.sh"]
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    # profiles:
+    #   - ollama
+
+  # Elasticsearch - Optional Vector Database
+  elasticsearch:
+    container_name: elasticsearch_db
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - elasticsearch
+
+  # ChromaDB - Optional Vector Database
+  chromadb:
+    container_name: chroma_db
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      CHROMA_HOST: 0.0.0.0
+      CHROMA_PORT: 8000
+    networks:
+      - qa-network
+    restart: unless-stopped
+    profiles:
+      - chromadb
+
+  # Nginx - Load Balancer/Reverse Proxy (Optional)
+  nginx:
+    container_name: nginx_proxy
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - web
+    networks:
+      - qa-network
+    restart: unless-stopped
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  qdrant_data:
+  elasticsearch_data:
+  chromadb_data:
+  ollama_data:
+  app_logs:
+  worker_temp:
+  celery_beat_data:
+
+networks:
+  qa-network:
+    name: qa-network
+    driver: bridge
+    
